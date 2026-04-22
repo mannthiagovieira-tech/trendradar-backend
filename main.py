@@ -181,12 +181,12 @@ Responda APENAS JSON válido sem markdown:
 @app.get("/score")
 async def score_ep(term:str=Query(...),geo:str=Query("BR")):
     geo=geo.upper(); gp="BR" if geo=="BR" else ""
-    gt,rd,yt,sp=await asyncio.gather(asyncio.to_thread(fetch_google_trends,[term],gp),fetch_reddit(term,geo),fetch_youtube(term,geo),fetch_spotify(term,geo))
+    gt,rd,yt,sp,tk=await asyncio.gather(asyncio.to_thread(fetch_google_trends,[term],gp),fetch_reddit(term,geo),fetch_youtube(term,geo),fetch_spotify(term,geo),fetch_tiktok(term,geo))
     gt_data=gt.get(term,{"value":40,"velocity":0.4,"timeline":[]})
     signals={"google_trends":gt_data,"reddit":rd,"youtube":yt,"spotify":sp}
     scoring=compute_score(signals,geo)
-    real=[s for s,d in[("google_trends",PYTRENDS_OK),("reddit",rd.get("post_count",0)>0),("youtube",yt.get("video_count",0)>0),("spotify",sp.get("track_count",0)>0)] if d]
-    return{"term":term,"geo":geo,**scoring,"timeline":gt_data.get("timeline",[]),"fetched_at":datetime.now().isoformat(),"real_sources":real,"sources":{"google_trends":gt_data,"reddit":rd,"youtube":yt,"spotify":sp},"evidence":{"reddit_posts":rd.get("top_posts",[]),"youtube_videos":yt.get("top_videos",[]),"spotify_tracks":sp.get("top_tracks",[])}}
+    real=[s for s,d in[("google_trends",PYTRENDS_OK),("reddit",rd.get("post_count",0)>0),("youtube",yt.get("video_count",0)>0),("spotify",sp.get("track_count",0)>0),("tiktok",tk.get("video_count",0)>0)] if d]
+    return{"term":term,"geo":geo,**scoring,"timeline":gt_data.get("timeline",[]),"fetched_at":datetime.now().isoformat(),"real_sources":real,"sources":{"google_trends":gt_data,"reddit":rd,"youtube":yt,"spotify":sp,"tiktok":tk},"evidence":{"reddit_posts":rd.get("top_posts",[]),"youtube_videos":yt.get("top_videos",[]),"spotify_tracks":sp.get("top_tracks",[])}}
 
 @app.get("/")
 def root():
