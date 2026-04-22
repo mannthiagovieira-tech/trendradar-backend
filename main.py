@@ -14,6 +14,7 @@ ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY","")
 YOUTUBE_KEY    = os.getenv("YOUTUBE_API_KEY","")
 SPOTIFY_ID     = os.getenv("SPOTIFY_CLIENT_ID","")
 SPOTIFY_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET","")
+TIKAPI_KEY     = os.getenv("TIKAPI_KEY","")
 
 app = FastAPI(title="DMT TrendRadar API", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -95,6 +96,38 @@ async def fetch_spotify(term,geo="BR"):
         cache_set(key,res); return res
     except Exception as e: print(f"SP error:{e}"); import random; return {"value":random.randint(30,75),"velocity":0.4,"track_count":0,"top_tracks":[],"mock":True}
 
+
+async def fetch_tiktok(term, geo="BR"):
+    key = "tk:" + term + geo
+    cached = cache_get(key)
+    if cached: return cached
+    if not TIKAPI_KEY:
+        import random; return {"value": random.randint(30,75),"velocity":0.5,"video_count":0,"top_videos":[],"mock":True}
+    try:
+        lang = "pt-BR" if geo == "BR" else "en"
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"https://api.tikapi.io/public/search/video?keywords={term}&count=20&region={geo.lower()}&language={lang}",
+                headers={"X-API-KEY": TIKAPI_KEY}
+            )
+            data = r.json()
+        videos = data.get("data", {}).get("videos", []) or data.get("itemList", [])
+        if not videos:
+            import random; return {"value": random.randint(30,75),"velocity":0.5,"video_count":0,"top_videos":[],"mock":True}
+        plays = [v.get("stats",{}).get("playCount",0) for v in videos]
+        avg = sum(plays)/len(plays) if plays else 0
+        value = min(100, round(avg/100000*30 + len(videos)*2 + 20))
+        result = {
+            "value": value, "velocity": round(min(1.0,len(videos)/20),2),
+            "video_count": len(videos),
+            "top_videos": [{"title": v.get("desc","")[:80], "url": f"https://www.tiktok.com/@{v.get('author',{}).get('uniqueId','')}", "plays": v.get("stats",{}).get("playCount",0), "likes": v.get("stats",{}).get("diggCount",0), "author": v.get("author",{}).get("nickname","")} for v in sorted(videos, key=lambda x: x.get("stats",{}).get("playCount",0), reverse=True)[:3]]
+        }
+        cache_set(key, result)
+        return result
+    except Exception as e:
+        print(f"TikTok error: {e}")
+        import random; return {"value": random.randint(30,75),"velocity":0.5,"video_count":0,"top_videos":[],"mock":True}
+
 def compute_score(signals,geo):
     W={"google_trends":0.25,"reddit":0.20,"youtube":0.18,"spotify":0.12,"twitter":0.10,"tiktok":0.10,"instagram":0.05} if geo=="BR" else {"google_trends":0.25,"reddit":0.18,"youtube":0.20,"spotify":0.12,"twitter":0.12,"tiktok":0.08,"instagram":0.05}
     raw=0;n=0;vel=0;en=0
@@ -157,7 +190,7 @@ async def score_ep(term:str=Query(...),geo:str=Query("BR")):
 
 @app.get("/")
 def root():
-    cfg=[s for s,v in[("anthropic",ANTHROPIC_KEY),("youtube",YOUTUBE_KEY),("spotify",SPOTIFY_ID),("google_trends",PYTRENDS_OK)] if v]
+    cfg=[s for s,v in[("anthropic",ANTHROPIC_KEY),("youtube",YOUTUBE_KEY),("spotify",SPOTIFY_ID),("tiktok",TIKAPI_KEY),("google_trends",PYTRENDS_OK)] if v]
     return{"service":"DMT TrendRadar API v2","status":"ok","configured_sources":cfg,"docs":"/docs"}
 
 @app.get("/health")
