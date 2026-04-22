@@ -23,33 +23,6 @@ def cache_get(k,ttl=3600):
     e=_cache.get(k); return e["d"] if e and (time.time()-e["t"])<ttl else None
 def cache_set(k,d): _cache[k]={"d":d,"t":time.time()}
 
-def fetch_google_trends(t
- cat > main.py << 'ENDOFFILE'
-import os, time, asyncio
-from datetime import datetime
-from typing import Optional
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
-
-try:
-    from pytrends.request import TrendReq
-    PYTRENDS_OK = True
-except: PYTRENDS_OK = False
-
-ANTHROPIC_KEY  = os.getenv("ANTHROPIC_API_KEY","")
-YOUTUBE_KEY    = os.getenv("YOUTUBE_API_KEY","")
-SPOTIFY_ID     = os.getenv("SPOTIFY_CLIENT_ID","")
-SPOTIFY_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET","")
-
-app = FastAPI(title="DMT TrendRadar API", version="2.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-
-_cache = {}
-def cache_get(k,ttl=3600):
-    e=_cache.get(k); return e["d"] if e and (time.time()-e["t"])<ttl else None
-def cache_set(k,d): _cache[k]={"d":d,"t":time.time()}
-
 def fetch_google_trends(terms,geo="BR"):
     key=f"gt:{':'.join(terms)}:{geo}"
     if c:=cache_get(key): return c
