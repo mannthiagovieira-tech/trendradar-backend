@@ -927,15 +927,24 @@ WEIGHTS_WORLD = {
     "rss":           0.02,
 }
 
-def compute_score(signals: Dict[str, Any], geo: str) -> Dict[str, Any]:
+SPORTS_KEYWORDS = ("futebol", "football", "soccer", "copa", "brasileirão", "brasileirao",
+                   "libertadores", "champions", "nba", "basquete", "nfl", "esporte", "jogo")
+
+def compute_score(signals: Dict[str, Any], geo: str, term: str = "") -> Dict[str, Any]:
     W = WEIGHTS_BR if geo == "BR" else WEIGHTS_WORLD
     raw = 0.0
     n = 0
     vel = 0.0
     early = 0
+    term_lower = term.lower()
+    is_sports_term = any(k in term_lower for k in SPORTS_KEYWORDS)
     for src, w in W.items():
         s = signals.get(src)
         if not s:
+            continue
+        if s.get("mock"):
+            continue
+        if src == "football" and not is_sports_term:
             continue
         n += 1
         boost = 1.3 if geo == "BR" and src in ("reddit", "youtube", "spotify", "mercadolivre", "rss") else 1.0
@@ -943,6 +952,9 @@ def compute_score(signals: Dict[str, Any], geo: str) -> Dict[str, Any]:
         vel += s.get("velocity", 0)
         if s.get("value", 0) > 20 and src in ("reddit", "youtube", "twitter", "pinterest", "rss", "shazam"):
             early += 1
+    gt = signals.get("google_trends") or {}
+    if geo == "BR" and not gt.get("mock") and gt.get("value", 0) < 5:
+        raw *= 0.7
     diversity = 1 + (n / len(W)) * 0.3
     early_bonus = early * 5
     vel_bonus = (vel / max(n, 1)) * 10
@@ -1101,7 +1113,7 @@ async def score_ep(term: str = Query(...), geo: str = Query("BR")):
         "football":      rfb,
     }
 
-    scoring = compute_score(signals, geo)
+    scoring = compute_score(signals, geo, term)
 
     real_sources = [k for k, v in signals.items() if v and not v.get("mock")]
 
