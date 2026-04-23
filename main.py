@@ -587,6 +587,39 @@ async def fetch_rapid_shazam(term: str, geo: str = "BR") -> Dict[str, Any]:
         return mock_source(30, 65)
 
 # ============================================================================
+# 12b. SHAZAM TOP BR (charts) — usado para enriquecer o /briefing
+# ============================================================================
+async def fetch_shazam_top_br(limit: int = 10) -> List[Dict[str, str]]:
+    key = f"sh_top_br:{limit}"
+    if c := cache_get(key):
+        return c
+    if not RAPIDAPI_KEY:
+        return []
+    host = "shazam.p.rapidapi.com"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                f"https://{host}/charts/track",
+                params={"listId": "ip-country-chart-BR", "pageSize": str(limit), "startFrom": "0"},
+                headers=rapid_headers(host),
+            )
+            data = r.json()
+        tracks = data.get("tracks") or data.get("data") or []
+        out: List[Dict[str, str]] = []
+        for t in tracks[:limit]:
+            heading = t.get("heading") or {}
+            title = t.get("title") or heading.get("title") or ""
+            artist = t.get("subtitle") or heading.get("subtitle") or t.get("artist", "")
+            if title:
+                out.append({"title": title, "artist": artist})
+        if out:
+            cache_set(key, out)
+        return out
+    except Exception as e:
+        print(f"[ShazamTopBR] error: {e}")
+        return []
+
+# ============================================================================
 # 13. RAPIDAPI — AMAZON (real-time-amazon-data.p.rapidapi.com)
 # ============================================================================
 async def fetch_rapid_amazon(term: str, geo: str = "BR") -> Dict[str, Any]:
@@ -1008,13 +1041,32 @@ async def briefing_ep(
 ):
     tl = related_terms.split(",") if related_terms else [term]
     rd = f"Google Trends BR:{gt_value}/100, Reddit:{reddit_value}/100" if (gt_value or reddit_value) else ""
+
+    # Contexto musical: Top 10 Shazam BR + músicas Spotify relacionadas ao termo
+    shazam_top, spotify_term = await asyncio.gather(
+        fetch_shazam_top_br(10),
+        fetch_spotify(term, geo),
+    )
+    shazam_lines = [f"{i+1}. {t['title']} — {t['artist']}" for i, t in enumerate(shazam_top)] if shazam_top else []
+    spotify_lines = [
+        f"{t.get('name','')} — {t.get('artist','')} (pop {t.get('popularity','?')})"
+        for t in (spotify_term.get("top_tracks") or [])
+    ]
+    music_block = ""
+    if shazam_lines:
+        music_block += f"\nMúsicas trending BR agora: {'; '.join(shazam_lines)}"
+    if spotify_lines:
+        music_block += f"\nSpotify relacionadas a '{term}': {'; '.join(spotify_lines)}"
+
     prompt = f"""Diretor criativo de marca brasileira de roupas personalizadas (camisetas, bonés, estampas).
-TREND:{term} GEO:{geo} SCORE:{score}/100 ESTÁGIO:{stage} TERMOS:{', '.join(tl)} {rd}
-Gere 5 ideias criativas de produto. Responda APENAS JSON válido sem markdown:
-{{"ideas":[{{"titulo":"","aplicacao":"","headline":"max 6 palavras","tags":["#t1"],"descricaoVisual":"","corPaleta":["c1"],"precoSugerido":"R$ XX","potencial":"ALTO|MEDIO|ESPECULATIVO","motivo":"1 frase"}}],"urgencia":""}}"""
-    result = await call_anthropic(prompt, 2000)
+TREND:{term} GEO:{geo} SCORE:{score}/100 ESTÁGIO:{stage} TERMOS:{', '.join(tl)} {rd}{music_block}
+Gere 5 ideias criativas de produto. Sempre que fizer sentido, use trocadilhos com letras/títulos das músicas trending BR e referências culturais ao momento musical (cite o artista/música no campo "motivo"). Responda APENAS JSON válido sem markdown:
+{{"ideas":[{{"titulo":"","aplicacao":"","headline":"max 6 palavras","tags":["#t1"],"descricaoVisual":"","corPaleta":["c1"],"precoSugerido":"R$ XX","potencial":"ALTO|MEDIO|ESPECULATIVO","motivo":"1 frase"}}],"urgencia":"","music_context":{{"shazam_top_br":{json.dumps(shazam_lines, ensure_ascii=False)},"spotify_related":{json.dumps(spotify_lines, ensure_ascii=False)}}}}}"""
+    result = await call_anthropic(prompt, 2200)
     if not result:
         return {"error": "Configure ANTHROPIC_API_KEY no Railway", "ideas": [], "urgencia": ""}
+    # Garante eco do contexto musical mesmo se o modelo omitir
+    result.setdefault("music_context", {"shazam_top_br": shazam_lines, "spotify_related": spotify_lines})
     return result
 
 @app.post("/analyze")
