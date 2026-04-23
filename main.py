@@ -1190,6 +1190,12 @@ Responda APENAS JSON válido sem markdown:
         return {"error": "Configure ANTHROPIC_API_KEY no Railway", "urgency": "MEDIA", "recommendation": "Configure a API key"}
     return result
 
+@app.get("/shazam-br")
+async def shazam_br(limit: int = Query(10, ge=1, le=50)):
+    """Top músicas Shazam BR em tempo real (proxy de shazam-api6)."""
+    tracks = await fetch_shazam_top_br(limit)
+    return {"tracks": tracks, "count": len(tracks), "fetched_at": datetime.now().isoformat()}
+
 @app.get("/trending-br")
 async def trending():
     if not PYTRENDS_OK:
