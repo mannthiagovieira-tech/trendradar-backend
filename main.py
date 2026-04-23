@@ -1,4 +1,4 @@
-import os, time, asyncio, json, random
+import os, time, asyncio, json, random, re
 from datetime import datetime
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Query
@@ -372,6 +372,11 @@ async def fetch_rapid_tiktok(term: str, geo: str = "BR") -> Dict[str, Any]:
 # 8. RAPIDAPI — INSTAGRAM (instagram-scraper-stable-api.p.rapidapi.com)
 # ============================================================================
 async def fetch_rapid_instagram(term: str, geo: str = "BR") -> Dict[str, Any]:
+    """instagram-scraper-stable-api: GET /search_hashtag.php?hashtag=<tag>
+    Resposta: { name, posts:{count, edges}, top_posts:{edges:[{node:{...}}]}, pagination_token }
+    `posts.count` é o total histórico do hashtag — excelente sinal de tamanho/popularidade.
+    """
+    import math
     key = f"rig:{term}"
     if c := cache_get(key):
         return c
@@ -382,29 +387,49 @@ async def fetch_rapid_instagram(term: str, geo: str = "BR") -> Dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(
-                f"https://{host}/get_ig_hashtag_posts.php",
+                f"https://{host}/search_hashtag.php",
                 params={"hashtag": hashtag},
                 headers=rapid_headers(host),
             )
+            if r.status_code in (401, 403):
+                print(f"[RapidInstagram] {r.status_code} — verifique subscription/quota: {r.text[:120]}")
+                return mock_source(30, 70)
             data = r.json()
-        posts = data.get("data", {}).get("items", []) or data.get("items", []) or data.get("edges", [])
-        if not posts:
+        total_count = (data.get("posts") or {}).get("count", 0) or 0
+        top_edges = (data.get("top_posts") or {}).get("edges", []) or []
+        if not top_edges and not total_count:
             return mock_source(30, 70)
-        likes = [p.get("like_count", 0) or p.get("edge_liked_by", {}).get("count", 0) for p in posts]
-        avg_likes = sum(likes) / len(likes) if likes else 0
-        value = min(100, round(len(posts) * 3 + avg_likes / 1000 + 20))
+
+        # Score base: log10 do total de posts (10k→48, 100k→60, 1M→72, 10M→84)
+        base = min(85, round(math.log10(max(total_count, 10)) * 12)) if total_count else 30
+        # Bônus: engajamento médio dos top_posts (likes + comments)
+        likes = [(e.get("node") or {}).get("edge_liked_by", {}).get("count", 0) or 0 for e in top_edges]
+        comments = [(e.get("node") or {}).get("edge_media_to_comment", {}).get("count", 0) or 0 for e in top_edges]
+        avg_likes = round(sum(likes) / len(likes)) if likes else 0
+        avg_comments = round(sum(comments) / len(comments)) if comments else 0
+        eng_bonus = min(15, round(avg_likes / 5000))
+        value = min(100, base + eng_bonus)
+        velocity = round(min(1.0, (avg_likes / 50000) + (len(top_edges) / 30)), 2)
+
+        def caption_of(node):
+            edges = ((node or {}).get("edge_media_to_caption") or {}).get("edges") or []
+            return ((edges[0] or {}).get("node", {}).get("text", "") if edges else "")[:90]
+
         res = {
             "value": value,
-            "velocity": round(min(1.0, len(posts) / 20), 2),
-            "post_count": len(posts),
-            "avg_likes": round(avg_likes),
+            "velocity": velocity,
+            "post_count": total_count,
+            "top_posts_count": len(top_edges),
+            "avg_likes": avg_likes,
+            "avg_comments": avg_comments,
             "top_posts": [
                 {
-                    "caption": (p.get("caption", {}).get("text") if isinstance(p.get("caption"), dict) else p.get("caption", ""))[:80] if p.get("caption") else "",
-                    "likes": p.get("like_count", 0),
-                    "url": f"https://instagram.com/p/{p.get('code') or p.get('shortcode', '')}",
+                    "caption": caption_of(e.get("node")),
+                    "likes": (e.get("node") or {}).get("edge_liked_by", {}).get("count", 0),
+                    "comments": (e.get("node") or {}).get("edge_media_to_comment", {}).get("count", 0),
+                    "url": f"https://instagram.com/p/{(e.get('node') or {}).get('shortcode', '')}",
                 }
-                for p in sorted(posts, key=lambda x: -(x.get("like_count", 0) or 0))[:3]
+                for e in sorted(top_edges, key=lambda x: -((x.get("node") or {}).get("edge_liked_by", {}).get("count", 0) or 0))[:3]
             ],
         }
         cache_set(key, res)
@@ -750,7 +775,11 @@ async def fetch_rapid_imdb(term: str, geo: str = "BR") -> Dict[str, Any]:
 # 16. RAPIDAPI — FOOTBALL BR (free-api-live-football-data.p.rapidapi.com)
 # ============================================================================
 async def fetch_rapid_football(term: str, geo: str = "BR") -> Dict[str, Any]:
-    key = f"rfb:{term}:{geo}"
+    """free-api-live-football-data: GET /football-get-matches-by-date?date=YYYYMMDD
+    O termo não filtra (a API não suporta busca por termo). Usamos atividade do dia
+    como proxy: muitos jogos hoje = sinal alto para a fonte football. Peso baixo (0.03 BR / 0.01 WORLD).
+    """
+    key = f"rfb:{geo}:{datetime.now().strftime('%Y%m%d')}"
     if c := cache_get(key):
         return c
     if not RAPIDAPI_KEY:
@@ -759,27 +788,57 @@ async def fetch_rapid_football(term: str, geo: str = "BR") -> Dict[str, Any]:
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(
-                f"https://{host}/football-get-all-matches-by-country-name",
-                params={"countryname": "Brazil" if geo == "BR" else "World"},
+                f"https://{host}/football-get-matches-by-date",
+                params={"date": datetime.now().strftime("%Y%m%d")},
                 headers=rapid_headers(host),
             )
+            if r.status_code in (401, 403):
+                print(f"[RapidFootball] {r.status_code} — verifique subscription/quota: {r.text[:120]}")
+                return mock_source(20, 55)
             data = r.json()
-        matches = data.get("response", {}).get("matches", []) or data.get("matches", []) or []
-        tl = term.lower()
-        relevant = [m for m in matches if tl in json.dumps(m, default=str).lower()]
-        if not relevant:
+        matches = (data.get("response") or {}).get("matches", []) or data.get("matches", []) or []
+        if not matches:
             return mock_source(20, 55)
+
+        # Times BR (nomes únicos — evita falso positivo com "Atletico Madrid" etc.)
+        BR_TEAMS = {
+            "flamengo","palmeiras","corinthians","são paulo","sao paulo","fluminense",
+            "botafogo","grêmio","gremio","cruzeiro","vasco","bahia","fortaleza",
+            "athletico paranaense","atlético paranaense","athletico-pr","atlético-pr",
+            "atlético mineiro","atletico mineiro","red bull bragantino","cuiabá","cuiaba",
+            "juventude","brasileirão","brasileirao","copa do brasil",
+        }
+        BR_RE = re.compile(r"\b(" + "|".join(re.escape(t) for t in BR_TEAMS) + r")\b")
+        def is_br_match(m):
+            blob = (str(m.get("home",{})) + " " + str(m.get("away",{})) + " " + str(m.get("tournamentStage",""))).lower()
+            return bool(BR_RE.search(blob))
+        br_matches = [m for m in matches if is_br_match(m)] if geo == "BR" else []
+        active = br_matches if (geo == "BR" and br_matches) else matches
+
+        # Score: atividade do dia. BR_matches quando geo=BR pesam mais.
+        base = min(85, len(active) * 2 + 25)
+        if geo == "BR" and br_matches:
+            base = min(95, base + len(br_matches) * 4)
+        velocity = round(min(1.0, len(active) / 60), 2)
+
+        def team_name(t):
+            return (t or {}).get("name", "") if isinstance(t, dict) else str(t or "")
+        def status_str(s):
+            return (s or {}).get("label", "") if isinstance(s, dict) else str(s or "")
+
         res = {
-            "value": min(100, len(relevant) * 6 + 30),
-            "velocity": round(min(1.0, len(relevant) / 10), 2),
-            "match_count": len(relevant),
+            "value": base,
+            "velocity": velocity,
+            "match_count": len(active),
+            "br_match_count": len(br_matches),
             "top_matches": [
                 {
-                    "home": m.get("home", {}).get("name", "") if isinstance(m.get("home"), dict) else str(m.get("home", "")),
-                    "away": m.get("away", {}).get("name", "") if isinstance(m.get("away"), dict) else str(m.get("away", "")),
-                    "status": m.get("status", {}).get("label", "") if isinstance(m.get("status"), dict) else str(m.get("status", "")),
+                    "home": team_name(m.get("home")),
+                    "away": team_name(m.get("away")),
+                    "status": status_str(m.get("status")),
+                    "time": m.get("time", ""),
                 }
-                for m in relevant[:3]
+                for m in active[:3]
             ],
         }
         cache_set(key, res)
