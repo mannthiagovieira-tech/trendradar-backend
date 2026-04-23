@@ -54,7 +54,13 @@ def mock_source(base_low=30, base_high=70, velocity=0.4) -> Dict[str, Any]:
     return {"value": random.randint(base_low, base_high), "velocity": velocity, "mock": True}
 
 def rapid_headers(host: str) -> Dict[str, str]:
-    return {"X-RapidAPI-Key": RAPIDAPI_KEY, "X-RapidAPI-Host": host}
+    # User-Agent custom é necessário em hosts protegidos por Cloudflare
+    # (youtube-v311 e shazam-api6 retornam 1010 sem UA válido)
+    return {
+        "X-RapidAPI-Key": RAPIDAPI_KEY,
+        "X-RapidAPI-Host": host,
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    }
 
 # ============================================================================
 # 1. GOOGLE TRENDS (pytrends)
@@ -530,37 +536,47 @@ async def fetch_rapid_twitter(term: str, geo: str = "BR") -> Dict[str, Any]:
         return mock_source(30, 70)
 
 # ============================================================================
-# 11. RAPIDAPI — YOUTUBE V3 (youtube-v31.p.rapidapi.com)
+# 11. RAPIDAPI — YOUTUBE (youtube-v311.p.rapidapi.com)
 # ============================================================================
 async def fetch_rapid_youtube(term: str, geo: str = "BR") -> Dict[str, Any]:
+    """youtube-v311: GET /search?q=...&part=snippet&type=video&maxResults=20
+    Host protegido por Cloudflare — rapid_headers já injeta User-Agent válido.
+    """
     key = f"ryt:{term}:{geo}"
     if c := cache_get(key):
         return c
     if not RAPIDAPI_KEY:
         return mock_source(30, 70)
-    host = "youtube-v31.p.rapidapi.com"
-    region = geo if geo != "WORLD" else "US"
+    host = "youtube-v311.p.rapidapi.com"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(
                 f"https://{host}/search",
-                params={"q": term, "part": "snippet,id", "regionCode": region, "maxResults": "20", "type": "video", "order": "date"},
+                params={"q": term, "part": "snippet", "type": "video", "maxResults": "20"},
                 headers=rapid_headers(host),
             )
+            if r.status_code in (401, 403):
+                print(f"[RapidYouTube] {r.status_code} — verifique subscription: {r.text[:120]}")
+                return mock_source(30, 70)
             data = r.json()
-        items = data.get("items", [])
+        items = data.get("items", []) or []
         if not items:
             return mock_source(30, 70)
+        total_results = (data.get("pageInfo") or {}).get("totalResults", 0) or 0
+        # Score base: amount of recent videos + tamanho do resultado total
+        import math
+        base = min(80, len(items) * 3 + (round(math.log10(total_results) * 6) if total_results else 0))
         res = {
-            "value": min(100, len(items) * 5 + 20),
+            "value": min(100, base),
             "velocity": round(min(1.0, len(items) / 20), 2),
             "video_count": len(items),
+            "total_results": total_results,
             "top_videos": [
                 {
-                    "title": i.get("snippet", {}).get("title", ""),
-                    "url": f"https://youtube.com/watch?v={i.get('id', {}).get('videoId', '')}",
-                    "channel": i.get("snippet", {}).get("channelTitle", ""),
-                    "published": i.get("snippet", {}).get("publishedAt", "")[:10],
+                    "title": (i.get("snippet") or {}).get("title", ""),
+                    "url": f"https://youtube.com/watch?v={(i.get('id') or {}).get('videoId', '')}",
+                    "channel": (i.get("snippet") or {}).get("channelTitle", ""),
+                    "published": ((i.get("snippet") or {}).get("publishedAt", "") or "")[:10],
                 }
                 for i in items[:3]
             ],
@@ -572,102 +588,116 @@ async def fetch_rapid_youtube(term: str, geo: str = "BR") -> Dict[str, Any]:
         return mock_source(30, 70)
 
 # ============================================================================
-# 12. RAPIDAPI — SHAZAM (shazam.p.rapidapi.com)
+# 12. RAPIDAPI — SHAZAM (shazam-api6.p.rapidapi.com)
+#   Essa API só expõe top charts por país — não tem search por termo.
+#   fetch_rapid_shazam reaproveita o top BR: se o termo bate com algum
+#   título/artista do top, sinal é forte; caso contrário, sinal base.
 # ============================================================================
-async def fetch_rapid_shazam(term: str, geo: str = "BR") -> Dict[str, Any]:
-    key = f"rsh:{term}"
-    if c := cache_get(key):
-        return c
-    if not RAPIDAPI_KEY:
-        return mock_source(30, 65)
-    host = "shazam.p.rapidapi.com"
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(
-                f"https://{host}/search",
-                params={"term": term, "locale": "pt-BR" if geo == "BR" else "en-US", "offset": "0", "limit": "20"},
-                headers=rapid_headers(host),
-            )
-            data = r.json()
-        tracks = data.get("tracks", {}).get("hits", [])
-        if not tracks:
-            return mock_source(30, 65)
-        res = {
-            "value": min(100, len(tracks) * 4 + 25),
-            "velocity": round(min(1.0, len(tracks) / 15), 2),
-            "track_count": len(tracks),
-            "top_tracks": [
-                {
-                    "title": t.get("track", {}).get("title", ""),
-                    "artist": t.get("track", {}).get("subtitle", ""),
-                    "url": t.get("track", {}).get("url", ""),
-                }
-                for t in tracks[:3]
-            ],
-        }
-        cache_set(key, res)
-        return res
-    except Exception as e:
-        print(f"[RapidShazam] error: {e}")
-        return mock_source(30, 65)
+SHAZAM_HOST = "shazam-api6.p.rapidapi.com"
 
-# ============================================================================
-# 12b. SHAZAM TOP BR (charts) — usado para enriquecer o /briefing
-# ============================================================================
-async def fetch_shazam_top_br(limit: int = 10) -> List[Dict[str, str]]:
-    key = f"sh_top_br:{limit}"
+async def _fetch_shazam_top(country_code: str = "BR", limit: int = 10) -> List[Dict[str, str]]:
+    key = f"sh_top:{country_code}:{limit}"
     if c := cache_get(key):
         return c
     if not RAPIDAPI_KEY:
         return []
-    host = "shazam.p.rapidapi.com"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             r = await client.get(
-                f"https://{host}/charts/track",
-                params={"listId": "ip-country-chart-BR", "pageSize": str(limit), "startFrom": "0"},
-                headers=rapid_headers(host),
+                f"https://{SHAZAM_HOST}/shazam/top_tracks_country",
+                params={"country_code": country_code, "limit": str(limit)},
+                headers=rapid_headers(SHAZAM_HOST),
             )
+            if r.status_code in (401, 403):
+                print(f"[Shazam] {r.status_code} — verifique subscription: {r.text[:120]}")
+                return []
             data = r.json()
         tracks = data.get("tracks") or data.get("data") or []
         out: List[Dict[str, str]] = []
         for t in tracks[:limit]:
-            heading = t.get("heading") or {}
-            title = t.get("title") or heading.get("title") or ""
-            artist = t.get("subtitle") or heading.get("subtitle") or t.get("artist", "")
+            title = t.get("title", "") or ""
+            artist = t.get("subtitle", "") or t.get("artist", "") or ""
+            rank = t.get("rank")
             if title:
-                out.append({"title": title, "artist": artist})
+                out.append({"title": title, "artist": artist, "rank": rank})
         if out:
             cache_set(key, out)
         return out
     except Exception as e:
-        print(f"[ShazamTopBR] error: {e}")
+        print(f"[Shazam] error: {e}")
         return []
 
+async def fetch_rapid_shazam(term: str, geo: str = "BR") -> Dict[str, Any]:
+    cc = "BR" if geo == "BR" else "US"
+    top = await _fetch_shazam_top(cc, 10)
+    if not top:
+        return mock_source(30, 65)
+    term_lc = term.lower().strip()
+    hits = []
+    for t in top:
+        blob = f"{t.get('title','')} {t.get('artist','')}".lower()
+        if term_lc and term_lc in blob:
+            hits.append(t)
+    value = min(100, 30 + len(hits) * 20) if hits else 30
+    velocity = round(min(1.0, len(hits) / 5), 2) if hits else 0.2
+    return {
+        "value": value,
+        "velocity": velocity,
+        "track_count": len(top),
+        "matches_in_top": len(hits),
+        "top_tracks": [
+            {"title": t.get("title",""), "artist": t.get("artist",""), "rank": t.get("rank"),
+             "url": f"https://www.shazam.com/track/search?q={t.get('title','').replace(' ','+')}"}
+            for t in (hits or top[:3])
+        ],
+    }
+
+# Alias mantém compatibilidade com /briefing que já chama fetch_shazam_top_br
+async def fetch_shazam_top_br(limit: int = 10) -> List[Dict[str, str]]:
+    return await _fetch_shazam_top("BR", limit)
+
 # ============================================================================
-# 13. RAPIDAPI — AMAZON (real-time-amazon-data.p.rapidapi.com)
+# 13. RAPIDAPI — AMAZON (Bilgisam Ltd)
 # ============================================================================
 async def fetch_rapid_amazon(term: str, geo: str = "BR") -> Dict[str, Any]:
+    """amazon-products-api-prices-api-reviews-api-data-api (Bilgisam Ltd):
+    GET /searchProductsWithDetails?query=...&number=20&country=BR&category=fashion&noqueue=1&page=1
+    Response: { status, message, results:[...], page, cacheTime }
+    """
     key = f"ramz:{term}:{geo}"
     if c := cache_get(key):
         return c
     if not RAPIDAPI_KEY:
         return mock_source(25, 65)
-    host = "real-time-amazon-data.p.rapidapi.com"
+    host = "amazon-products-api-prices-api-reviews-api-data-api.p.rapidapi.com"
     country = "BR" if geo == "BR" else "US"
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
+        async with httpx.AsyncClient(timeout=25) as client:
             r = await client.get(
-                f"https://{host}/search",
-                params={"query": term, "country": country, "page": "1", "sort_by": "RELEVANCE"},
+                f"https://{host}/searchProductsWithDetails",
+                params={
+                    "query": term,
+                    "number": "20",
+                    "country": country,
+                    "category": "fashion",
+                    "noqueue": "1",
+                    "page": "1",
+                },
                 headers=rapid_headers(host),
             )
+            if r.status_code in (401, 403):
+                print(f"[RapidAmazon] {r.status_code} — verifique subscription: {r.text[:120]}")
+                return mock_source(25, 65)
             data = r.json()
-        products = data.get("data", {}).get("products", [])
+        products = data.get("results", []) or data.get("data", {}).get("products", []) or []
         if not products:
             return mock_source(25, 65)
-        ratings = [p.get("product_star_rating", 0) for p in products if p.get("product_star_rating")]
-        avg_rating = sum(float(x) for x in ratings) / len(ratings) if ratings else 0
+        def num(x):
+            try: return float(str(x).replace(",", ".").split()[0])
+            except: return 0.0
+        ratings = [num(p.get("rating") or p.get("product_star_rating")) for p in products]
+        ratings = [x for x in ratings if x > 0]
+        avg_rating = sum(ratings) / len(ratings) if ratings else 0
         value = min(100, len(products) * 3 + round(avg_rating * 6) + 15)
         res = {
             "value": value,
@@ -676,10 +706,10 @@ async def fetch_rapid_amazon(term: str, geo: str = "BR") -> Dict[str, Any]:
             "avg_rating": round(avg_rating, 2),
             "top_products": [
                 {
-                    "title": p.get("product_title", "")[:80],
-                    "price": p.get("product_price", ""),
-                    "rating": p.get("product_star_rating", ""),
-                    "url": p.get("product_url", ""),
+                    "title": (p.get("title") or p.get("product_title", ""))[:80],
+                    "price": p.get("price") or p.get("product_price", ""),
+                    "rating": p.get("rating") or p.get("product_star_rating", ""),
+                    "url": p.get("url") or p.get("product_url", ""),
                 }
                 for p in products[:3]
             ],
@@ -691,7 +721,8 @@ async def fetch_rapid_amazon(term: str, geo: str = "BR") -> Dict[str, Any]:
         return mock_source(25, 65)
 
 # ============================================================================
-# 14. RAPIDAPI — ETSY (etsy-api3.p.rapidapi.com)
+# 14. RAPIDAPI — ETSY (etsy-api2.p.rapidapi.com)
+#   GET /product/search?query=...  → { response: [ {title, url, images, price...} ] }
 # ============================================================================
 async def fetch_rapid_etsy(term: str, geo: str = "BR") -> Dict[str, Any]:
     key = f"rety:{term}"
@@ -699,18 +730,28 @@ async def fetch_rapid_etsy(term: str, geo: str = "BR") -> Dict[str, Any]:
         return c
     if not RAPIDAPI_KEY:
         return mock_source(25, 60)
-    host = "etsy-api3.p.rapidapi.com"
+    host = "etsy-api2.p.rapidapi.com"
     try:
         async with httpx.AsyncClient(timeout=20) as client:
             r = await client.get(
-                f"https://{host}/search",
-                params={"q": term, "limit": "20"},
+                f"https://{host}/product/search",
+                params={"query": term, "limit": "20", "offset": "0",
+                        "sort_on": "relevance", "sort_order": "desc"},
                 headers=rapid_headers(host),
             )
+            if r.status_code in (401, 403):
+                print(f"[RapidEtsy] {r.status_code} — verifique subscription: {r.text[:120]}")
+                return mock_source(25, 60)
             data = r.json()
-        listings = data.get("results", []) or data.get("data", {}).get("listings", []) or data.get("listings", [])
+        listings = data.get("response", []) or data.get("results", []) or \
+                   data.get("data", {}).get("listings", []) or data.get("listings", []) or []
         if not listings:
             return mock_source(25, 60)
+        def price_of(l):
+            p = l.get("price") or l.get("priceSummary") or {}
+            if isinstance(p, dict):
+                return p.get("salePrice") or p.get("originalPrice") or p.get("amount") or ""
+            return str(p)
         res = {
             "value": min(100, len(listings) * 3 + 25),
             "velocity": round(min(1.0, len(listings) / 20), 2),
@@ -718,7 +759,7 @@ async def fetch_rapid_etsy(term: str, geo: str = "BR") -> Dict[str, Any]:
             "top_listings": [
                 {
                     "title": (l.get("title") or l.get("name", ""))[:80],
-                    "price": l.get("price", {}).get("amount", 0) if isinstance(l.get("price"), dict) else l.get("price", ""),
+                    "price": price_of(l),
                     "url": l.get("url") or l.get("listing_url", ""),
                 }
                 for l in listings[:3]
